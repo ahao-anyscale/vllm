@@ -67,6 +67,38 @@ class EngineCore:
                  log_stats: bool,
                  executor_fail_callback: Optional[Callable] = None):
 
+        import torch
+        # Setup torch profiler to generate Chrome trace for EngineCore initialization
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True
+        ) as prof:
+            self._profile_engine_core_init(vllm_config, executor_class, log_stats, executor_fail_callback)
+        
+        # Export the trace to Chrome trace format
+        import datetime
+        import os
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            trace_file = os.path.abspath(f"engine_core_init_profile_{timestamp}.json")
+            prof.export_chrome_trace(trace_file)
+            print(f"[DEBUG] EngineCore profiling trace file created at: {trace_file}")
+        except Exception as e:
+            print(f"[DEBUG] EngineCore profiling export error: {e}")
+
+    def _profile_engine_core_init(self,
+                                  vllm_config: VllmConfig,
+                                  executor_class: type[Executor],
+                                  log_stats: bool,
+                                  executor_fail_callback: Optional[Callable] = None):
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
         load_general_plugins()
