@@ -161,10 +161,9 @@ class WorkerExtension:
         dtype = getattr(torch, dtype_name)
         weight = torch.empty(shape, dtype=dtype, device="cuda")
         torch.distributed.broadcast(weight, src=0, group=self.model_update_group)
-
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
-        del weight
+        del weight  
 
     def check_weights_changed(self):
         """
@@ -174,6 +173,119 @@ class WorkerExtension:
         for name, p in self.model_runner.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(p, torch.zeros_like(p))
         return weights_updated
+
+
+@ray.remote(num_gpus=1)
+class FSDPModel:
+    """FSDP-sharded training model distributed across multiple GPUs.
+
+    Creates one instance per rank. Each instance:
+    1. Initializes its FSDP process group
+    2. Loads and shards the model with FSDP
+    3. Exposes a weight syncing API for broadcasting to vLLM
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        fsdp_world_size: int,
+        master_addr: str,
+        master_port: int,
+    ):
+        import os as _os
+        import torch.distributed as dist
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy
+
+        self.rank = rank
+        self.fsdp_world_size = fsdp_world_size
+
+        # Set the device for this rank (each Ray actor sees only its GPU as cuda:0)
+        torch.cuda.set_device(0)
+        _os.environ["WORLD_SIZE"] = str(fsdp_world_size)
+        _os.environ["RANK"] = str(rank)
+        _os.environ["LOCAL_RANK"] = "0"  # Each Ray actor gets its own GPU
+        _os.environ["MASTER_ADDR"] = master_addr
+        _os.environ["MASTER_PORT"] = str(master_port)
+
+        # Initialize the process group for FSDP communication
+        dist.init_process_group(
+            backend="nccl",
+            world_size=fsdp_world_size,
+            rank=rank,
+        )
+
+        # Load the model and wrap with FSDP for sharding
+        model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
+        self.model = FSDP(
+            model.to("cuda"),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            device_id=torch.cuda.current_device(),
+        )
+
+        self.vllm_weight_update_group = None
+
+    def init_weight_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        world_size: int,
+    ):
+        """Initialize the weight update group for syncing with vLLM.
+
+        Only rank 0 of FSDP participates in vLLM weight sync.
+
+        Args:
+            master_address: Address for the vLLM weight update group
+            master_port: Port for the vLLM weight update group
+            rank_offset: Rank offset for this process in the vLLM weight update group
+            world_size: Total world size of the vLLM weight update group
+        """
+        self.vllm_weight_update_group = init_custom_process_group(
+            backend="nccl",
+            init_method=get_tcp_url(master_address, master_port),
+            world_size=world_size,
+            rank=0,
+            group_name="vllm_weight_update_group",
+        )
+
+    def zero_weights(self):
+        """Zero out all model weights (for demonstration purposes)."""
+        for p in self.model.parameters():
+            p.data.zero_()
+
+    def sync_weights_to_vllm(self, llm):
+        """Gather sharded params and broadcast to vLLM.
+
+        Should only be called on rank 0. Iterates through all model parameters,
+        gathers each sharded DTensor from all FSDP ranks, then broadcasts
+        the full parameter to vLLM workers.
+
+        Args:
+            llm: Ray actor reference to the vLLM engine
+        """
+        from torch.distributed.tensor import DTensor
+        def dtype_to_str(dtype):
+            if dtype == torch.float32:
+                return "float32"
+            elif dtype == torch.float16:
+                return "float16"
+            elif dtype == torch.bfloat16:
+                return "bfloat16"
+            else:
+                raise ValueError(f"Unsupported dtype: {dtype}")
+
+        params = self.model.state_dict()
+        for name, param in params.items():
+            param = param.to(self.device).full_tensor() if isinstance(param, DTensor) else param
+            dtype_name = dtype_to_str(param.dtype)
+            shape = param.shape
+            if self.rank == 0:
+                handle = llm.collective_rpc.remote("update_weight", args=(name, dtype_name, shape))
+                print(f"DEBUG: update_weight: {name}, shape: {param.data.shape}")
+                torch.distributed.broadcast(param.data, 0, group=self.vllm_weight_update_group)
+                ray.get(handle)
+            torch.distributed.barrier()
 
 
 class MyLLM:
@@ -217,6 +329,7 @@ class MyLLM:
         finish_reason = "abort"
         while finish_reason == "abort":
             await self._wait_for_generation_to_resume()
+            print("DEBUG: STARTING GENERATE")
             output = await self.generate(prompt, sampling_params)
             finish_reason = output.outputs[0].finish_reason
             if finish_reason == "abort":
@@ -248,11 +361,18 @@ class MyLLM:
             await asyncio.sleep(0.5)
 
 
-@ray.remote(num_gpus=1)
+
+
+
+@ray.remote(num_gpus=0)
 def main():
-    # Load the OPT-125M model onto GPU 0 for the training workload.
-    train_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
-    train_model.to("cuda:0")
+    # # Load the OPT-125M model onto GPU 0 for the training workload.
+    # train_model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
+    # train_model.to("cuda:0")
+    fsdp_size = 1
+    master_addr = get_ip()
+    master_port = get_open_port()
+    train_model = [FSDPModel.remote(rank=rank, fsdp_world_size=fsdp_size, master_addr=master_addr, master_port=master_port) for rank in range(fsdp_size)]
 
     # Create a placement group that reserves GPU 1–2 for the vLLM inference engine.
     # Learn more about Ray placement groups:
@@ -267,6 +387,7 @@ def main():
 
     # Launch the vLLM inference engine. The `enforce_eager` flag reduces
     # start-up latency.
+    vllm_tp_size = 2
     llm = ray.remote(
         num_cpus=0,
         num_gpus=0,
@@ -275,7 +396,7 @@ def main():
         model="facebook/opt-125m",
         enforce_eager=True,
         worker_extension_cls="rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=vllm_tp_size,
         distributed_executor_backend="ray",
     )
 
@@ -284,18 +405,19 @@ def main():
     master_address = get_ip()
     master_port = get_open_port()
 
-    handle = llm.collective_rpc.remote(
-        "init_weight_update_group", args=(master_address, master_port, 1, 3)
+    vllm_handle = llm.collective_rpc.remote(
+        "init_weight_update_group", args=(master_address, master_port, 1, 1 + vllm_tp_size)
     )
 
-    model_update_group = init_custom_process_group(
-        backend="nccl",
-        init_method=get_tcp_url(master_address, master_port),
-        world_size=3,
-        rank=0,
-        group_name="vllm_weight_update_group",
-    )
-    ray.get(handle)
+    # model_update_group = init_custom_process_group(
+    #     backend="nccl",
+    #     init_method=get_tcp_url(master_address, master_port),
+    #     world_size=3,
+    #     rank=0,
+    #     group_name="vllm_weight_update_group",
+    # )
+    train_handle = train_model[0].init_weight_update_group.remote(master_address, master_port, 1 + vllm_tp_size)
+    ray.get([vllm_handle, train_handle])
 
     # Generate text from the prompts.
     prompts = [
@@ -325,24 +447,26 @@ def main():
     print(f"Prompt: {output.prompt!r}\nGenerated text: {output.outputs[0].text!r}")
     print(f"Stop reason: {output.outputs[0].finish_reason!r}")
 
-    # Simulate a training step by zeroing out all model weights.
-    # In a real RLHF training loop the weights would be updated using the gradient
-    # from an RL objective such as PPO on a reward model.
-    for name, p in train_model.named_parameters():
-        p.data.zero_()
+    # # Simulate a training step by zeroing out all model weights.
+    # # In a real RLHF training loop the weights would be updated using the gradient
+    # # from an RL objective such as PPO on a reward model.
+    # for name, p in train_model.named_parameters():
+    #     p.data.zero_()
 
-    # Synchronize the updated weights to the inference engine.
-    for name, p in train_model.named_parameters():
-        dtype_name = str(p.dtype).split(".")[-1]
-        handle = llm.collective_rpc.remote(
-            "update_weight", args=(name, dtype_name, p.shape)
-        )
-        print(f"DEBUG: update_weight: {name}, shape: {p.data.shape}")
-        torch.distributed.broadcast(p.data, src=0, group=model_update_group)
-        ray.get(handle)
+    # # Synchronize the updated weights to the inference engine.
+    # for name, p in train_model.named_parameters():
+    #     dtype_name = str(p.dtype).split(".")[-1]
+    #     handle = llm.collective_rpc.remote(
+    #         "update_weight", args=(name, dtype_name, p.shape)
+    #     )
+    #     torch.distributed.broadcast(p.data, src=0, group=model_update_group)
+    #     ray.get(handle)
+    ray.get([model.zero_weights.remote() for model in train_model])
+    ray.get([model.sync_weights_to_vllm.remote(llm) for model in train_model])
 
     # Verify that the inference weights have been updated.
-    assert all(ray.get(llm.collective_rpc.remote("check_weights_changed")))
+    weights_changed = ray.get(llm.collective_rpc.remote("check_weights_changed"))
+    assert all(weights_changed), f"Weights not updated: {weights_changed}"
 
     # Resume generation
     ray.get(llm.resume_generation.remote())
