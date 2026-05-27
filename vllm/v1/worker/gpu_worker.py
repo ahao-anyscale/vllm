@@ -139,6 +139,7 @@ class Worker(WorkerBase):
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._is_checkpoint_format = True
+        self._reload_offload_enabled = False
 
         # Torch/CUDA profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -987,7 +988,11 @@ class Worker(WorkerBase):
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
-    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+    def start_weight_update(
+        self,
+        is_checkpoint_format: bool = True,
+        enable_reload_offload: bool = False,
+    ) -> None:
         """
         Start a new weight update.
 
@@ -999,6 +1004,11 @@ class Worker(WorkerBase):
             is_checkpoint_format: Whether incoming weights are in checkpoint
                 format (need layerwise processing) or kernel format (direct
                 copy). Stored as state for finish_weight_update.
+            enable_reload_offload: If True, unmap per-layer weight memory at
+                the start of this checkpoint-format weight update and remap
+                it lazily as each layer is processed. Requires
+                `enable_sleep_mode=True` and the cumem allocator. Ignored
+                when `is_checkpoint_format=False`.
         """
         self._check_weight_transfer_engine()
 
@@ -1008,6 +1018,18 @@ class Worker(WorkerBase):
                 "already active. Call finish_weight_update first."
             )
 
+        reload_offload_enabled = enable_reload_offload and is_checkpoint_format
+        if reload_offload_enabled:
+            model_config = self.vllm_config.model_config
+            if not model_config.enable_sleep_mode:
+                raise ValueError(
+                    "enable_reload_offload=True requires enable_sleep_mode=True."
+                )
+            if not model_config.enable_cumem_allocator:
+                raise ValueError(
+                    "enable_reload_offload=True requires the cumem allocator."
+                )
+
         if is_checkpoint_format:
             from vllm.model_executor.model_loader.reload import (
                 initialize_layerwise_reload,
@@ -1015,10 +1037,13 @@ class Worker(WorkerBase):
 
             model = self.model_runner.model
             with torch.device(self.device):
-                initialize_layerwise_reload(model)
+                initialize_layerwise_reload(
+                    model, reload_offload_enabled=reload_offload_enabled
+                )
 
         # Store state so update_weights/finish_weight_update can check
         self._is_checkpoint_format = is_checkpoint_format
+        self._reload_offload_enabled = reload_offload_enabled
         self._weight_update_active = True
 
     def update_weights(self, update_info: dict) -> None:
@@ -1083,6 +1108,7 @@ class Worker(WorkerBase):
             )
 
         is_checkpoint_format = self._is_checkpoint_format
+        reload_offload_enabled = self._reload_offload_enabled
 
         if is_checkpoint_format:
             from vllm.model_executor.model_loader.reload import (
@@ -1091,11 +1117,16 @@ class Worker(WorkerBase):
 
             model = self.model_runner.model
             with torch.device(self.device):
-                finalize_layerwise_reload(model, self.model_config)
+                finalize_layerwise_reload(
+                    model,
+                    self.model_config,
+                    reload_offload_enabled=reload_offload_enabled,
+                )
 
         # Reset state
         self._weight_update_active = False
         self._is_checkpoint_format = True
+        self._reload_offload_enabled = False
 
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.

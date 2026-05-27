@@ -11,7 +11,8 @@
 import dataclasses
 import gc
 import os
-from collections.abc import Callable, Iterator
+from bisect import bisect_right
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -53,6 +54,7 @@ class AllocationData:
     handle: HandleType
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
+    is_mapped: bool = True
 
 
 def create_and_map(allocation_handle: HandleType) -> None:
@@ -198,6 +200,10 @@ class CuMemAllocator:
         for ptr, data in self.pointer_to_data.items():
             handle = data.handle
             total_bytes += handle[1]
+            if not data.is_mapped:
+                # Already unmapped (e.g. by per-layer reload-offload). Skip
+                # the unmap call but still treat as freed.
+                continue
             if data.tag in offload_tags:
                 backup_bytes += handle[1]
                 size_in_bytes = handle[1]
@@ -211,6 +217,7 @@ class CuMemAllocator:
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
+            data.is_mapped = False
 
         logger.info(
             "CuMemAllocator: sleep freed %.2f GiB memory in total, of which "
@@ -236,8 +243,11 @@ class CuMemAllocator:
         """
         for ptr, data in self.pointer_to_data.items():
             if tags is None or data.tag in tags:
+                if data.is_mapped:
+                    continue
                 handle = data.handle
                 create_and_map(handle)
+                data.is_mapped = True
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
@@ -316,3 +326,95 @@ class CuMemAllocator:
             handle = data.handle
             sum_bytes += handle[1]
         return sum_bytes
+
+    def lookup_handles_for_tensors(
+        self, tensors: Iterable[torch.Tensor]
+    ) -> list[HandleType]:
+        """
+        Map each tensor's storage data_ptr to the AllocationData whose
+        [ptr, ptr+size) range contains it. Returns unique handles preserving
+        insertion order. Raises if a tensor lives outside any tracked
+        allocation (caller error -- tensor wasn't allocated under
+        use_memory_pool).
+        """
+        # Build a sorted list of (start_ptr, size, handle) entries once per
+        # call so we can binary-search each tensor's data_ptr.
+        entries = sorted(
+            (ptr, data.handle[1], data.handle)
+            for ptr, data in self.pointer_to_data.items()
+        )
+        starts = [ptr for ptr, _, _ in entries]
+
+        result: list[HandleType] = []
+        seen: set[HandleType] = set()
+        for tensor in tensors:
+            try:
+                storage = tensor.untyped_storage()
+                tensor_ptr = storage.data_ptr()
+            except (RuntimeError, ValueError) as e:
+                raise ValueError(
+                    "Cannot look up CuMemAllocator handle for tensor: "
+                    f"unable to read storage data_ptr ({e})."
+                ) from e
+
+            idx = bisect_right(starts, tensor_ptr) - 1
+            if idx < 0:
+                raise ValueError(
+                    f"Tensor at {hex(tensor_ptr)} lives outside any tracked "
+                    "CuMemAllocator allocation -- it was not allocated under "
+                    "use_memory_pool."
+                )
+            start, size, handle = entries[idx]
+            if not (start <= tensor_ptr < start + size):
+                raise ValueError(
+                    f"Tensor at {hex(tensor_ptr)} lives outside any tracked "
+                    "CuMemAllocator allocation -- it was not allocated under "
+                    "use_memory_pool."
+                )
+            if handle not in seen:
+                seen.add(handle)
+                result.append(handle)
+        return result
+
+    def unmap_handles(self, handles: Iterable[HandleType]) -> None:
+        """
+        Unmap the physical pages for the given allocations. Virtual addresses
+        remain reserved and tensor.data_ptr() stays stable. Idempotent on
+        already-unmapped handles (no-op).
+        """
+        for handle in handles:
+            py_d_mem = handle[2]
+            data = self.pointer_to_data.get(py_d_mem)
+            if data is None or not data.is_mapped:
+                continue
+            # Drain pending kernels before unmapping (mirrors the
+            # synchronize in _python_free_callback). Without this, in-flight
+            # work on the soon-to-be-unmapped pages races and surfaces as
+            # CUDA_ERROR_ILLEGAL_ADDRESS.
+            torch.cuda.synchronize(data.handle[0])
+            unmap_and_release(data.handle)
+            data.is_mapped = False
+
+    def remap_handles(self, handles: Iterable[HandleType]) -> None:
+        """
+        Remap previously-unmapped allocations. Pages are freshly allocated;
+        contents are undefined (no CPU backup is read). Idempotent on
+        already-mapped handles.
+        """
+        for handle in handles:
+            py_d_mem = handle[2]
+            data = self.pointer_to_data.get(py_d_mem)
+            if data is None or data.is_mapped:
+                continue
+            create_and_map(data.handle)
+            data.is_mapped = True
+
+    def is_handle_mapped(self, handle: HandleType) -> bool:
+        """
+        Return True if the given handle currently has physical pages mapped.
+        Unknown handles are reported as unmapped.
+        """
+        data = self.pointer_to_data.get(handle[2])
+        if data is None:
+            return False
+        return data.is_mapped

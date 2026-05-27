@@ -3,6 +3,7 @@
 import inspect
 from collections.abc import Callable
 from functools import wraps
+from itertools import chain
 from weakref import WeakKeyDictionary, WeakSet
 
 import torch
@@ -14,6 +15,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .meta import (
+    SKIP_MODULES,
     SKIP_TENSORS,
     capture_layer_to_meta,
     get_numel_loaded,
@@ -80,8 +82,70 @@ def record_metadata_for_reloading(model: torch.nn.Module):
         info.restore_device = torch.get_default_device()
 
 
+def _get_cumem_allocator():
+    """Return the CuMemAllocator singleton, or None if unavailable."""
+    from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+    if not cumem_available:
+        return None
+    return CuMemAllocator.get_instance()
+
+
+def _capture_kernel_handles(
+    layer: torch.nn.Module, info: LayerReloadingInfo, allocator
+) -> None:
+    """Populate info.kernel_handles for a layer.
+
+    Filters out SKIP_TENSORS and SKIP_MODULES (§5.3a of the design):
+    - Whole module skipped if its class is in SKIP_MODULES.
+    - Handles backing SKIP_TENSORS are pinned mapped: they're excluded
+      from the unmap set so reload doesn't destroy their contents.
+    - Handles shared between a SKIP_TENSOR and a regular weight are also
+      pinned mapped (we lose that allocation's savings but preserve
+      correctness).
+    """
+    assert info.kernel_tensors is not None
+
+    if layer.__class__.__name__ in SKIP_MODULES:
+        info.kernel_handles = []
+        return
+
+    params, buffers = info.kernel_tensors
+
+    reload_tensors = list(
+        chain(
+            (t for n, t in params.items() if n not in SKIP_TENSORS),
+            (t for n, t in buffers.items() if n not in SKIP_TENSORS),
+        )
+    )
+    skip_tensors = list(
+        chain(
+            (t for n, t in params.items() if n in SKIP_TENSORS),
+            (t for n, t in buffers.items() if n in SKIP_TENSORS),
+        )
+    )
+
+    reload_handles = allocator.lookup_handles_for_tensors(reload_tensors)
+    pinned = set(allocator.lookup_handles_for_tensors(skip_tensors))
+
+    info.kernel_handles = [h for h in reload_handles if h not in pinned]
+
+    lost = len(set(reload_handles)) - len(info.kernel_handles)
+    if lost > 0:
+        logger.debug(
+            "%s: %d handle(s) pinned mapped because they share storage "
+            "with SKIP_TENSORS",
+            layer.__class__.__name__,
+            lost,
+        )
+
+
 @torch.no_grad()
-def initialize_layerwise_reload(model: torch.nn.Module):
+def initialize_layerwise_reload(
+    model: torch.nn.Module,
+    *,
+    reload_offload_enabled: bool = False,
+):
     """
     Set up layerwise weight loading with deferred processing.
 
@@ -89,6 +153,8 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     1. Saves current kernel tensors for later copying
     2. Restores layer parameters/buffers from metadata (on meta device)
     3. Wraps weight loaders to defer processing until all weights are loaded
+    4. If `reload_offload_enabled`, unmaps physical pages for each layer's
+       kernel storage so peak GPU memory drops to ~1× layer during reload.
 
     When all weights for a layer are loaded, the wrapped loaders will:
     1. Materialize the layer onto the target device
@@ -100,6 +166,14 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False
 
+    allocator = _get_cumem_allocator() if reload_offload_enabled else None
+    if reload_offload_enabled and allocator is None:
+        raise RuntimeError(
+            "reload_offload_enabled=True but CuMemAllocator is unavailable."
+        )
+
+    initialized_infos: list[LayerReloadingInfo] = []
+
     for layer in model.modules():
         info = get_layerwise_info(layer)
 
@@ -110,11 +184,47 @@ def initialize_layerwise_reload(model: torch.nn.Module):
         # Save current tensors for later copying
         info.kernel_tensors = get_layer_params_buffers(layer)
 
+        # Capture handles backing kernel tensors (before restore_layer_on_meta
+        # swaps params to meta -- info.kernel_tensors still holds strong refs).
+        if reload_offload_enabled:
+            _capture_kernel_handles(layer, info, allocator)
+
         # Restore layer parameters/buffers onto meta device
         restore_layer_on_meta(layer, info)
 
         # Wrap weight loaders to buffer loading
         initialize_online_processing(layer)
+
+        initialized_infos.append(info)
+
+    # Batch-unmap every captured handle in a single pass. Doing this after
+    # the per-layer loop (rather than inside it) correctly handles
+    # allocations shared across layers: dedup collapses them so we unmap
+    # once.
+    if reload_offload_enabled:
+        assert allocator is not None
+        all_handles = list(
+            dict.fromkeys(
+                h for info in initialized_infos for h in (info.kernel_handles or [])
+            )
+        )
+
+        # Debug telemetry (§6.1): handles-per-layer distribution, shared
+        # handles, pinned-by-SKIP counts.
+        if logger.isEnabledFor(10):  # logging.DEBUG
+            total_captured = sum(
+                len(info.kernel_handles or []) for info in initialized_infos
+            )
+            shared = total_captured - len(all_handles)
+            logger.debug(
+                "reload-offload: %d layers, %d unique handles to unmap, "
+                "%d handle uses shared across layers",
+                len(initialized_infos),
+                len(all_handles),
+                shared,
+            )
+
+        allocator.unmap_handles(all_handles)
 
 
 def initialize_online_processing(layer: torch.nn.Module):
@@ -213,7 +323,12 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
     return online_process_loader
 
 
-def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelConfig):
+def finalize_layerwise_processing(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+    *,
+    reload_offload_enabled: bool = False,
+):
     """
     Apply processing to any layers which were not layerwise processed during loading.
     This includes attention layers and layers which have weight elements which are not
@@ -224,51 +339,87 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
 
     :param model: model to finalize processing for
     :param model_config: config needed for applying processing to attention layers
+    :param reload_offload_enabled: if True, run the per-layer unmap/remap
+        bookkeeping that pairs with `initialize_layerwise_reload`
     """
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
 
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
+    all_infos: list[LayerReloadingInfo] = []
 
-    for layer in model.modules():
-        info = get_layerwise_info(layer)
-        if not info.can_load():
-            info.reset()
-            continue
+    allocator = _get_cumem_allocator() if reload_offload_enabled else None
 
-        # Attention/MLA layers are processed after all other layers
-        if isinstance(layer, (Attention, MLAAttention)):
-            deferred_attn.append((layer, info))
-            continue
-
-        # No weights were loaded
-        if info.load_numel <= 0:
-            # first load: checkpoint did not contain weights for this layer
-            if info.kernel_tensors is None:
-                _layerwise_process(layer, info)
+    try:
+        for layer in model.modules():
+            info = get_layerwise_info(layer)
+            all_infos.append(info)
+            if not info.can_load():
+                info.reset()
                 continue
 
-            # reloading: place kernel tensors back as a fallback
-            elif info.load_numel_total > 0:  # type: ignore[operator]
-                logger.warning("%s: Failed to load weights", layer.__class__.__name__)
-                _place_kernel_tensors(layer, info)
+            # Attention/MLA layers are processed after all other layers
+            if isinstance(layer, (Attention, MLAAttention)):
+                deferred_attn.append((layer, info))
+                continue
 
-        # Process non-attention layers which did not load all elements. This can happen
-        # if the created weight has extra padding elements which are not loaded
-        # Having too many of these delayed layers can lead to excess memory usage
-        # see Limitations(4)
-        elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
-            logger.debug("%s: Delayed processing", layer.__class__.__name__)
-            _layerwise_process(layer, info)
+            # No weights were loaded
+            if info.load_numel <= 0:
+                # first load: checkpoint did not contain weights for this layer
+                if info.kernel_tensors is None:
+                    _layerwise_process(layer, info)
+                    continue
 
-        info.reset()
+                # reloading: place kernel tensors back as a fallback
+                elif info.load_numel_total > 0:  # type: ignore[operator]
+                    logger.warning(
+                        "%s: Failed to load weights", layer.__class__.__name__
+                    )
+                    # Remap kernel storage before placing tensors back -- a
+                    # layer that never had _layerwise_process fire still
+                    # needs mapped pages for steady-state inference.
+                    if info.kernel_handles and allocator is not None:
+                        allocator.remap_handles(info.kernel_handles)
+                    _place_kernel_tensors(layer, info)
 
-    # Process attention layers after all other layers are done
-    for layer, info in deferred_attn:
-        _finalize_attention_layer(layer, info, model_config)
-        info.reset()
+            # Process non-attention layers which did not load all elements. This can
+            # happen if the created weight has extra padding elements which are not
+            # loaded. Having too many of these delayed layers can lead to excess
+            # memory usage; see Limitations(4)
+            elif info.load_numel > 0 and info.load_numel < info.load_numel_total:  # type: ignore[operator]
+                logger.debug("%s: Delayed processing", layer.__class__.__name__)
+                _layerwise_process(layer, info)
 
-    LOADING_LAYERS.clear()
+            info.reset()
+
+        # Process attention layers after all other layers are done
+        for layer, info in deferred_attn:
+            _finalize_attention_layer(layer, info, model_config)
+            info.reset()
+
+        LOADING_LAYERS.clear()
+    finally:
+        # Safety net (§5.6): regardless of how we exit the loop above, every
+        # layer's kernel handles must be remapped before control returns to
+        # the engine. A missed remap would surface as a CUDA fault on the
+        # next forward pass.
+        if reload_offload_enabled and allocator is not None:
+            still_unmapped = [
+                h
+                for info in all_infos
+                for h in (info.kernel_handles or [])
+                if not allocator.is_handle_mapped(h)
+            ]
+            if still_unmapped:
+                logger.warning(
+                    "Remapping %d handle(s) missed by reload",
+                    len(still_unmapped),
+                )
+                allocator.remap_handles(still_unmapped)
+            # Clear kernel_handles so a subsequent reload cycle doesn't
+            # see stale state.
+            for info in all_infos:
+                info.kernel_handles = None
 
 
 def finalize_layerwise_reload(*args, **kwargs):
@@ -278,6 +429,14 @@ def finalize_layerwise_reload(*args, **kwargs):
 def _finalize_attention_layer(
     layer: torch.nn.Module, info: LayerReloadingInfo, model_config: ModelConfig
 ) -> None:
+    # Remap physical pages if the layer's kernel storage was offloaded.
+    # Attention layers don't contain SKIP_TENSORS today so this is just
+    # "remap everything we captured."
+    if info.kernel_handles:
+        allocator = _get_cumem_allocator()
+        if allocator is not None:
+            allocator.remap_handles(info.kernel_handles)
+
     if info.load_numel > 0 and info.kernel_tensors is not None:
         # Reload with new scale weights from checkpoint
         _place_kernel_tensors(layer, info)
@@ -327,6 +486,15 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     3. Runs quantization processing if applicable
     4. Copies processed values back to original tensor storage
     """
+    # Remap physical pages for this layer's kernel storage before
+    # materialization. _copy_and_restore_kernel_tensors will later copy
+    # processed weights into this storage; if pages are still unmapped at
+    # that point, the copy would fault.
+    if info.kernel_handles:
+        allocator = _get_cumem_allocator()
+        if allocator is not None:
+            allocator.remap_handles(info.kernel_handles)
+
     # Materialize layer tensors onto device
     materialize_layer(layer, info)
 

@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
 from inspect import BoundArguments
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.device_allocator.cumem import HandleType
 
 __all__ = ["LayerTensors", "LayerReloadingInfo"]
 
@@ -28,6 +32,10 @@ class LayerReloadingInfo:
 
     # kernel formatted tensors, copied into by `_layerwise_process` when reloading
     kernel_tensors: LayerTensors | None = None
+
+    # CuMemAllocator handles backing kernel_tensors. Populated when
+    # `enable_reload_offload` is on so reload can unmap/remap per layer.
+    kernel_handles: "list[HandleType] | None" = None
 
     def reset(self):
         self.__init__(  # type: ignore[misc]
